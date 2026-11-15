@@ -1,0 +1,101 @@
+_format_version: "3.0"
+_transform: true
+
+consumers:
+  - username: alice
+    id: 11111111-1111-4111-8111-111111111111
+    keyauth_credentials:
+      - key: alice-demo-key
+  - username: bob
+    id: 22222222-2222-4222-8222-222222222222
+    keyauth_credentials:
+      - key: bob-demo-key
+  - username: carol
+    id: 33333333-3333-4333-8333-333333333333
+    keyauth_credentials:
+      - key: carol-demo-key
+  - username: dave
+    id: 44444444-4444-4444-8444-444444444444
+    keyauth_credentials:
+      - key: dave-demo-key
+
+services:
+  - name: authenticated-api
+    url: http://upstream:8080
+    read_timeout: 500
+    retries: 0
+    routes:
+      - name: orders
+        paths: ["/orders"]
+        strip_path: false
+      - name: other
+        paths: ["/products", "/fail", "/slow"]
+        strip_path: false
+    plugins:
+      - name: key-auth
+        config:
+          hide_credentials: true
+      - name: distributed-rate-limit
+        config:
+          namespace: demo
+          policy_id: public-api
+          redis_mode: sentinel
+          sentinel_master: limiter
+          sentinel_nodes:
+            - {host: sentinel-a, port: 26379}
+            - {host: sentinel-b, port: 26379}
+            - {host: sentinel-c, port: 26379}
+
+  - name: isolated-api
+    url: http://upstream:8080
+    routes:
+      - name: isolated
+        paths: ["/isolated"]
+        strip_path: false
+    plugins:
+      - name: distributed-rate-limit
+        config:
+          namespace: demo
+          policy_id: isolated-api
+          redis_mode: sentinel
+          sentinel_master: limiter
+          sentinel_nodes:
+            - {host: sentinel-a, port: 26379}
+            - {host: sentinel-b, port: 26379}
+            - {host: sentinel-c, port: 26379}
+
+  - name: identity-api
+    url: http://upstream:8080
+    routes:
+      - name: identity
+        paths: ["/private", "/free"]
+        strip_path: false
+    plugins:
+      - name: distributed-rate-limit
+        config:
+          namespace: demo
+          policy_id: identity-api
+          redis_mode: sentinel
+          sentinel_master: limiter
+          sentinel_nodes:
+            - {host: sentinel-a, port: 26379}
+            - {host: sentinel-b, port: 26379}
+            - {host: sentinel-c, port: 26379}
+
+  - name: ip-api
+    url: http://upstream:8080
+    routes:
+      - name: ip
+        paths: ["/ip"]
+        strip_path: false
+    plugins:
+      - name: distributed-rate-limit
+        config:
+          namespace: demo
+          policy_id: ip-api
+          redis_mode: sentinel
+          sentinel_master: limiter
+          sentinel_nodes:
+            - {host: sentinel-a, port: 26379}
+            - {host: sentinel-b, port: 26379}
+            - {host: sentinel-c, port: 26379}

@@ -1,0 +1,4 @@
+FROM kong:3.9.1
+USER root
+COPY kong/plugins/distributed-rate-limit /usr/local/share/lua/5.1/kong/plugins/distributed-rate-limit
+USER kong
