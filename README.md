@@ -191,7 +191,8 @@ AGENTS.md                            # Contributor instructions
 ```
 
 Redis bootstrap, outage, maintenance and verification scripts are demo tooling,
-not a production rollout controller. The original assignment PDF is retained.
+not a production rollout controller. The assignment PDF is kept locally and
+excluded from version control.
 
 ## Important boundaries
 

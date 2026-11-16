@@ -42,10 +42,11 @@ Request-rate limits alone cannot bound in-flight work when upstream latency grow
 
 ```mermaid
 flowchart TB
-    Deployment["Kong deployment configuration<br/>Routes, authentication, proxy trust<br/>Plugin bindings and Redis connection"]
-    YAML["Operator-authored YAML policy"]
+    Deployment["config/kong.yaml + Compose environment<br/>Routes, authentication, bindings, Redis connection<br/>Proxy trust from Compose environment"]
+    YAML["config/policies.yaml"]
     CLI["Publication CLI<br/>Validate, prepare, activate"]
-    Client["Client"] --> LB["Trusted LB, if present"]
+    ProxyConfig["config/proxy.conf"] -.-> LB["Optional demo nginx proxy<br/>Separate from Kong"]
+    Client["Client"] --> LB
 
     subgraph Gateways["At least three Kong instances"]
         A["Kong A: adapter + core"]
@@ -61,23 +62,28 @@ flowchart TB
         Script --> History
     end
 
-    Replicas["Two Redis replicas"] -.->|"Possible promotion"| Redis
-    Redis -.->|"Asynchronous replication"| Replicas
-    Sentinel["Three Sentinels, quorum 2"] -.->|"Discovery / election"| Redis
-    Sentinel -.-> A & B & C
+    Redis -.->|"Redis asynchronous replication"| Replicas["Two Redis replicas"]
+    Sentinel["Three Sentinels, quorum 2"] -.->|"Monitor / elect / reconfigure"| Redis
+    Sentinel -.->|"Monitor / reconfigure"| Replicas
+    A & B & C -.->|"Query current primary"| Sentinel
+    CLI -.->|"Query current primary"| Sentinel
 
     Deployment -.-> A & B & C
+    Deployment -.->|"CLI reads bindings / Redis settings"| CLI
     YAML -.-> CLI
-    CLI -.-> Policy
-    Policy -.-> A & B & C
+    CLI -.->|"Publish / prepare / activate"| Policy
+    A & B & C -.->|"Load revision / snapshot on demand"| Policy
     LB --> A & B & C
-    A & B & C --> Script
+    Client -->|"Direct localhost ports 8001-8003"| A & B & C
+    A & B & C -->|"Every request: EVAL revision gate"| Script
     A & B & C -->|"Confirmed admission only"| Upstream["Upstream"]
 ```
 
-Solid arrows show request processing; dashed arrows show configuration, discovery
-or replication.
-The LB is optional. The core is a module inside Kong, not a network service.
+Solid arrows show request processing; dashed arrows show configuration, control
+or replication. Clients query Sentinel and load policy; Redis does not push updates
+to gateways. Primary/replica are current roles, not permanent Compose service names.
+The optional demo nginx reads `config/proxy.conf`; it is not Kong's configuration.
+The core is a module inside Kong, not a network service.
 
 | Component | Responsibility |
 | --- | --- |
@@ -317,10 +323,18 @@ the business data plane. Use finite
 connection, operation, and refresh budgets; log internal causes without exposing
 addresses or secrets to clients.
 
-Fail-open or local fallback would sacrifice the shared quota contract and could
-overload a reduced-capacity upstream. This is the submission trade-off, not a
-requirement that all production gateways fail closed. Availability-first
-degradation is future work in section 9.
+When a trustworthy limiter decision is unavailable:
+
+| Choice | Behavior and trade-off |
+| --- | --- |
+| Current: fail-closed | Return 503 without forwarding, sacrificing business availability. This is our policy choice, not a Sentinel/Redis requirement. |
+| Future: storage-outage fail-open or bounded local fallback | Continue forwarding to prioritize data-plane availability, accepting possible shared-limit overruns and upstream overload; forwarding does not guarantee upstream availability. |
+
+Section 9 defines the future degradation boundary: do not automatically allow
+configuration/policy or identity errors; confirmed quota exhaustion remains 429.
+This availability choice is separate from consistency: even fail-closed cannot
+prevent over-admission when asynchronous failover loses history and the new
+primary returns a valid allow decision against its reduced history.
 
 A lost response may follow a completed mutation: HTTP 503 can consume quota
 without upstream forwarding, and admission counts are not actual billing.
@@ -625,29 +639,61 @@ failures and lossless Kong rollout remain unverified.
 
 ## 9. Production gaps
 
-| Gap | Impact and next consideration |
-| --- | --- |
-| Failure domains and ingress | Redis process HA is implemented, but Compose is one host. Deploy members in independent failure domains and provide HA ingress/upstream. Kong rolling maintenance remains deferred. |
-| Redis consistency/durability | Sentinel asynchronous replication may lose acknowledged counters and policy revisions; ROLE is not partition fencing. Define RPO and recovery contracts; strict failure-time quotas require a different consistency design. |
-| Availability-first degradation (not implemented) | Consider configurable storage-outage policies, bounded waiting or time-/quota-bounded local fallback with observability. Explicitly accept shared-limit overruns during degradation instead of claiming the normal global bound. |
-| Disaster recovery | Define acceptable downtime/state loss and recovery procedures; backups and replicas do not alone guarantee quota continuity. Redis Cluster shards data and requires same-slot keys for multi-key scripts. |
-| Capacity | Measure hot keys, script cleanup, retention memory, round-trip latency, and refresh churn. Set bounded windows, limits, and resource budgets. |
-| Operations/security | Metrics and alerts for latency, failures, rejects, and pending updates; protected Redis/publishing access, secret handling, and audited changes. |
-| Concurrency protection | Evaluate a separate gateway resource guard or operator-defined upstream cap. Global caps require release/crash handling; connection count is not HTTP request concurrency. |
-| Broader migrations | New rule coverage can require shadow accounting or explicit transition contracts; no universal lossless update claim. |
+These are business-dependent production considerations, not unfinished assignment
+requirements or implemented promises. Assess them against the expected workload
+and acceptable risk; no additional platform is mandatory.
 
-An availability-first policy must distinguish unavailable storage from missing or
-damaged configuration/policy and identity failures, rather than opening every error.
-Confirmed quota exhaustion remains HTTP 429. These are future design options,
-not current behavior; their suitability depends on the upstream's availability
-and protection requirements.
+**1. Failure policy.** Current fail-closed returns 503 and reduces business
+availability. Future storage-outage-only fail-open or time-/quota-bounded local
+fallback could keep forwarding, with monitoring and bounded recovery, but accepts
+shared-limit overruns and cannot guarantee upstream availability. Do not bypass
+identity or damaged-policy errors; confirmed quota exhaustion remains 429.
 
-Release pins, binding validation, key encoding, path boundaries, CLI syntax,
-snapshot preparation and budgets are resolved above. No control-plane service,
-DR, concurrency limiter or general structural migration was added. Redis Sentinel
-HA and bounded native Redis maintenance are included.
-The submission is a working bounded implementation, not production-ready
-infrastructure; production requirements can justify revisiting the decisions.
+**2. Consistency and recovery.** Redis asynchronous replication during
+Sentinel-managed failover can lose counts or policy revisions; ROLE does not
+fence a partitioned old primary. Define over-/under-admission tolerance and
+RPO/RTO; stricter consistency needs a different ownership/storage design.
+Exercise backup/restore of policy, sequence and pool history together: missing
+history must not silently become fresh quota. AOF, `noeviction` and `run_id` do
+not prove complete history. Validate clock jumps and longer-window rewarmup.
+
+**3. Performance and scale.** Exact logs grow with identity cardinality and
+retention; hot keys, cleanup, ROLE checks, EVAL transmission and validation add
+cost. Measure throughput, p95/p99 latency, memory and connection budgets before
+optimizing. Bound snapshot growth without deleting active/preparing history.
+Sharding must preserve all-rule atomicity; current code is not Redis Cluster-ready.
+Rate limits also do not bound in-flight work; add concurrency protection only
+if upstream behavior requires it.
+
+**4. Security and identity.** Public demo keys and unauthenticated Redis/Sentinel
+are not production settings. Use network isolation, verified TLS, tested
+least-privilege ACLs and injected/rotated secrets. Keep Consumer identity and
+trusted proxy mappings stable; audit path/IP normalization and retention/privacy.
+Hex IP encoding is not anonymization.
+
+**5. Configuration evolution.** The CLI fits small-scale updates. Higher change
+volume may need controlled, authorized and audited publishing that reuses its
+preparation/activation semantics, not a competing runtime authority.
+Cross-binding publication can partially succeed; reconcile it explicitly.
+Structural rule/identity/path changes need a history-preserving migration design.
+Identity-system mapping (Consumers may be applications), GitOps for Services/Routes
+and a policy platform are optional integrations; service discovery does not replace
+route rules. Reviewed declarative YAML itself can be used in production.
+
+**6. Deployment and operations.** Single-host Compose is not host/AZ redundancy.
+Place Redis/Sentinels and gateways across suitable failure domains and provide
+HA ingress/upstreams. Kong readiness, traffic withdrawal and in-flight draining
+belong to deployment tooling; lossless rolling upgrades are not implemented.
+Add bounded-cardinality decision/error/latency metrics, replication/memory and
+preparation alerts, plus outage/restore/maintenance runbooks. Demo scripts are
+not a production rollout controller.
+
+Before rollout, agree workload-specific latency/error and recovery targets.
+Extend section 8's evidence with load/soak, quota-matching fault traffic, real
+socket lost responses/partitions, state restoration and compatible rolling
+upgrade/rollback tests that preserve history. The existing `/free` HA checks
+demonstrate recovery, not fault-time quota accuracy. Maintain reproducible CI,
+dependency security updates and a tested version matrix; pins alone are not safety.
 
 ## References
 
