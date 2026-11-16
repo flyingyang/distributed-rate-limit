@@ -7,12 +7,22 @@ publisher discover the current primary automatically; the limiter is independent
 of the ingress product. Automatic failover and controlled patch maintenance have
 been exercised with continuous traffic through the real gateways.
 
-```text
-Kong authentication -> adapter/core -> Redis revision gate + all-rule admission
-                                    -> upstream, or 403 / 429 / 503
-Policy YAML -> Python CLI -> immutable snapshot -> preparation -> activation
-Sentinel -> current primary discovery -> Kong / publisher reconnect
+```mermaid
+flowchart LR
+    Client --> Kong["Three Kong gateways"]
+    Kong -->|"Confirmed admission only"| Upstream
+    Kong -->|"Atomic quota / revision check"| Redis["Current Redis primary"]
+    Redis -.->|"Async replication"| Replicas["Two Redis replicas"]
+    YAML["Policy YAML"] -.-> CLI["Publication CLI"]
+    CLI -.->|"Publish policy"| Redis
+    Kong -.->|"Query primary address"| Sentinel["Three Sentinels"]
+    CLI -.->|"Query primary address"| Sentinel
 ```
+
+Solid arrows show request processing; dashed arrows show control or replication,
+not Sentinel proxying requests. Redis roles can change after failover.
+The optional demo nginx proxy is omitted; gateways also accept direct access.
+See the [detailed architecture](docs/design.md#2-architecture).
 
 ## Reproduce
 
